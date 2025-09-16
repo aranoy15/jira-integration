@@ -3,6 +3,7 @@ Jira Client - полноценный клиент для работы с Jira AP
 """
 
 import requests
+import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
@@ -49,6 +50,10 @@ class JiraClient:
         self.password = password
         self.auth_type = auth_type
         self.session = requests.Session()
+
+        # Настройка логирования
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
 
         # Настройка авторизации
         self._setup_auth()
@@ -142,8 +147,8 @@ class JiraClient:
             # Проверяем что ответ JSON
             content_type = response.headers.get("content-type", "").lower()
             if "application/json" not in content_type:
-                print(f"⚠️ Сервер вернул не JSON. Content-Type: {content_type}")
-                print(f"Текст ответа: {response.text[:500]}")
+                self.logger.warning(f"⚠️ Сервер вернул не JSON. Content-Type: {content_type}")
+                self.logger.warning(f"Текст ответа: {response.text[:500]}")
                 raise ValueError(
                     f"Сервер вернул не JSON ответ. Content-Type: {content_type}"
                 )
@@ -151,22 +156,22 @@ class JiraClient:
             return response.json()
 
         except requests.exceptions.RequestException as e:
-            print(f"Ошибка при выполнении запроса {method} {url}: {e}")
+            self.logger.error(f"Ошибка при выполнении запроса {method} {url}: {e}")
             if hasattr(e, "response") and e.response is not None:
-                print(f"Статус код: {e.response.status_code}")
-                print(f"Заголовки ответа: {dict(e.response.headers)}")
-                print(f"Текст ответа (первые 500 символов): {e.response.text[:500]}")
+                self.logger.error(f"Статус код: {e.response.status_code}")
+                self.logger.error(f"Заголовки ответа: {dict(e.response.headers)}")
+                self.logger.error(f"Текст ответа (первые 500 символов): {e.response.text[:500]}")
                 try:
                     error_data = e.response.json()
-                    print(f"JSON ошибки: {error_data}")
+                    self.logger.error(f"JSON ошибки: {error_data}")
                 except:
-                    print("Ответ не является валидным JSON")
+                    self.logger.error("Ответ не является валидным JSON")
             raise
         except ValueError as e:
-            print(f"Ошибка парсинга JSON: {e}")
-            print(f"URL: {url}")
-            print(f"Метод: {method}")
-            print(f"Данные: {data}")
+            self.logger.error(f"Ошибка парсинга JSON: {e}")
+            self.logger.error(f"URL: {url}")
+            self.logger.error(f"Метод: {method}")
+            self.logger.error(f"Данные: {data}")
             raise
 
     # === Myself API методы ===
@@ -182,7 +187,7 @@ class JiraClient:
         try:
             return self._make_request("GET", "myself")
         except Exception as e:
-            print(f"Ошибка при получении информации о пользователе: {e}")
+            self.logger.error(f"Ошибка при получении информации о пользователе: {e}")
             raise
 
     def test_connection(self) -> bool:
@@ -194,10 +199,10 @@ class JiraClient:
         """
         try:
             self.get_myself()
-            print("✅ Соединение с Jira установлено успешно")
+            self.logger.info("✅ Соединение с Jira установлено успешно")
             return True
         except Exception as e:
-            print(f"❌ Ошибка соединения с Jira: {e}")
+            self.logger.error(f"❌ Ошибка соединения с Jira: {e}")
             return False
 
     # === Issue API методы ===
@@ -211,10 +216,10 @@ class JiraClient:
         """
         try:
             projects = self._make_request("GET", "project")
-            print(f"Найдено проектов: {len(projects)}")
+            self.logger.info(f"Найдено проектов: {len(projects)}")
             return projects
         except Exception as e:
-            print(f"Ошибка при получении проектов: {e}")
+            self.logger.error(f"Ошибка при получении проектов: {e}")
             return []
 
     def get_project(self, project_key_or_id: str) -> Dict:
@@ -230,7 +235,7 @@ class JiraClient:
         try:
             return self._make_request("GET", f"project/{project_key_or_id}")
         except Exception as e:
-            print(f"Ошибка при получении проекта {project_key_or_id}: {e}")
+            self.logger.error(f"Ошибка при получении проекта {project_key_or_id}: {e}")
             raise
 
     def search_issues(
@@ -263,10 +268,10 @@ class JiraClient:
 
         try:
             result = self._make_request("POST", "search", search_data)
-            print(f"Найдено задач: {result.get('total', 0)}")
+            self.logger.info(f"Найдено задач: {result.get('total', 0)}")
             return result
         except Exception as e:
-            print(f"Ошибка при поиске задач: {e}")
+            self.logger.error(f"Ошибка при поиске задач: {e}")
             raise
 
     def get_issue(
@@ -295,7 +300,7 @@ class JiraClient:
         try:
             return self._make_request("GET", f"issue/{issue_key_or_id}", params)
         except Exception as e:
-            print(f"Ошибка при получении задачи {issue_key_or_id}: {e}")
+            self.logger.error(f"Ошибка при получении задачи {issue_key_or_id}: {e}")
             raise
 
     def create_issue(self, issue: JiraIssue) -> str:
@@ -340,10 +345,10 @@ class JiraClient:
         try:
             result = self._make_request("POST", "issue", issue_data)
             issue_key = result.get("key")
-            print(f"✅ Задача создана: {issue_key}")
+            self.logger.info(f"✅ Задача создана: {issue_key}")
             return issue_key
         except Exception as e:
-            print(f"❌ Ошибка при создании задачи: {e}")
+            self.logger.error(f"❌ Ошибка при создании задачи: {e}")
             raise
 
     def update_issue(self, issue_key_or_id: str, fields: Dict[str, Any]) -> None:
@@ -357,9 +362,9 @@ class JiraClient:
         try:
             update_data = {"fields": fields}
             self._make_request("PUT", f"issue/{issue_key_or_id}", update_data)
-            print(f"✅ Задача {issue_key_or_id} обновлена")
+            self.logger.info(f"✅ Задача {issue_key_or_id} обновлена")
         except Exception as e:
-            print(f"❌ Ошибка при обновлении задачи {issue_key_or_id}: {e}")
+            self.logger.error(f"❌ Ошибка при обновлении задачи {issue_key_or_id}: {e}")
             raise
 
     def add_comment(self, issue_key_or_id: str, comment_body: str) -> None:
@@ -374,9 +379,9 @@ class JiraClient:
 
         try:
             self._make_request("POST", f"issue/{issue_key_or_id}/comment", comment_data)
-            print(f"✅ Комментарий добавлен к задаче {issue_key_or_id}")
+            self.logger.info(f"✅ Комментарий добавлен к задаче {issue_key_or_id}")
         except Exception as e:
-            print(
+            self.logger.error(
                 f"❌ Ошибка при добавлении комментария к задаче {issue_key_or_id}: {e}"
             )
             raise
@@ -428,10 +433,10 @@ class JiraClient:
         try:
             result = self._make_request("GET", "board", params, api_type="agile")
             boards = result.get("values", [])
-            print(f"Найдено досок: {len(boards)}")
+            self.logger.info(f"Найдено досок: {len(boards)}")
             return boards
         except Exception as e:
-            print(f"Ошибка при получении досок: {e}")
+            self.logger.error(f"Ошибка при получении досок: {e}")
             return []
 
     def get_board(self, board_id: int) -> Dict:
@@ -447,7 +452,7 @@ class JiraClient:
         try:
             return self._make_request("GET", f"board/{board_id}", api_type="agile")
         except Exception as e:
-            print(f"Ошибка при получении доски {board_id}: {e}")
+            self.logger.error(f"Ошибка при получении доски {board_id}: {e}")
             raise
 
     def get_board_issues(
@@ -483,10 +488,10 @@ class JiraClient:
                 "GET", f"board/{board_id}/issue", params, api_type="agile"
             )
             issues = result.get("issues", [])
-            print(f"Найдено задач на доске: {len(issues)}")
+            self.logger.info(f"Найдено задач на доске: {len(issues)}")
             return issues
         except Exception as e:
-            print(f"Ошибка при получении задач доски {board_id}: {e}")
+            self.logger.error(f"Ошибка при получении задач доски {board_id}: {e}")
             return []
 
     def get_board_backlog(
@@ -522,10 +527,10 @@ class JiraClient:
                 "GET", f"board/{board_id}/backlog", params, api_type="agile"
             )
             issues = result.get("issues", [])
-            print(f"Найдено задач в бэклоге: {len(issues)}")
+            self.logger.info(f"Найдено задач в бэклоге: {len(issues)}")
             return issues
         except Exception as e:
-            print(f"Ошибка при получении бэклога доски {board_id}: {e}")
+            self.logger.error(f"Ошибка при получении бэклога доски {board_id}: {e}")
             return []
 
     def create_sprint(
@@ -565,10 +570,10 @@ class JiraClient:
 
         try:
             result = self._make_request("POST", "sprint", sprint_data, api_type="agile")
-            print(f"✅ Создан спринт: {name}")
+            self.logger.info(f"✅ Создан спринт: {name}")
             return result
         except Exception as e:
-            print(f"❌ Ошибка при создании спринта: {e}")
+            self.logger.error(f"❌ Ошибка при создании спринта: {e}")
             raise
 
     def get_sprint_issues(
@@ -604,10 +609,10 @@ class JiraClient:
                 "GET", f"sprint/{sprint_id}/issue", params, api_type="agile"
             )
             issues = result.get("issues", [])
-            print(f"Найдено задач в спринте: {len(issues)}")
+            self.logger.info(f"Найдено задач в спринте: {len(issues)}")
             return issues
         except Exception as e:
-            print(f"Ошибка при получении задач спринта {sprint_id}: {e}")
+            self.logger.error(f"Ошибка при получении задач спринта {sprint_id}: {e}")
             return []
 
     def move_issues_to_sprint(self, sprint_id: int, issue_keys: List[str]) -> None:
@@ -624,9 +629,9 @@ class JiraClient:
             self._make_request(
                 "POST", f"sprint/{sprint_id}/issue", move_data, api_type="agile"
             )
-            print(f"✅ Перемещено {len(issue_keys)} задач в спринт {sprint_id}")
+            self.logger.info(f"✅ Перемещено {len(issue_keys)} задач в спринт {sprint_id}")
         except Exception as e:
-            print(f"❌ Ошибка при перемещении задач в спринт: {e}")
+            self.logger.error(f"❌ Ошибка при перемещении задач в спринт: {e}")
             raise
 
     def move_issues_to_backlog(self, issue_keys: List[str]) -> None:
@@ -640,7 +645,7 @@ class JiraClient:
 
         try:
             self._make_request("POST", "backlog/issue", move_data, api_type="agile")
-            print(f"✅ Перемещено {len(issue_keys)} задач в бэклог")
+            self.logger.info(f"✅ Перемещено {len(issue_keys)} задач в бэклог")
         except Exception as e:
-            print(f"❌ Ошибка при перемещении задач в бэклог: {e}")
+            self.logger.error(f"❌ Ошибка при перемещении задач в бэклог: {e}")
             raise
