@@ -27,7 +27,8 @@ class JiraIntegration:
         )
 
         self.running = True
-        await self.run()
+        async with self.jira_client:
+            await self.run()
 
     async def run(self):
         """Запуск интеграции"""
@@ -37,6 +38,7 @@ class JiraIntegration:
         tasks = [
             asyncio.create_task(self.jira_poller()),
             asyncio.create_task(self.issue_processor()),
+            asyncio.create_task(self.monitor_queue()),
         ]
 
         try:
@@ -91,7 +93,7 @@ class JiraIntegration:
                 item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 if item['type'] == 'issue_update':
                     raw_issue = item['data']
-                    self.handle_issue(raw_issue)
+                    await self.handle_issue(raw_issue)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -103,7 +105,7 @@ class JiraIntegration:
                 logging.error(f"Traceback: {traceback.format_exc()}")
                 await asyncio.wait_for(self.stop_event.wait(), timeout=1.0)
 
-    def handle_issue(self, raw_issue: Dict):
+    async def handle_issue(self, raw_issue: Dict):
         """
         Обработка задачи
 
@@ -116,7 +118,7 @@ class JiraIntegration:
 
             logging.info(f"Processing issue: {issue_key}")
 
-            projects = self.jira_client.get_projects()
+            projects = await self.jira_client.get_projects()
             if not projects:
                 logging.error("Нет доступных проектов в Jira")
                 return
@@ -124,7 +126,7 @@ class JiraIntegration:
             project_key = projects[0]['key']
             logging.info(f"Using project: {project_key}")
 
-            project_info = self.jira_client.get_project(project_key)
+            project_info = await self.jira_client.get_project(project_key)
             issue_types = project_info.get('issueTypes', [])
 
             issue_type = issue_types[0]['name'] if issue_types else 'Task'
@@ -138,7 +140,7 @@ class JiraIntegration:
             )
 
             logging.info(f"Creating issue with data: {issue}")
-            issue_key = self.jira_client.create_issue(issue)
+            issue_key = await self.jira_client.create_issue(issue)
             logging.info(f"Issue created: {issue_key}")
 
         except Exception as e:
@@ -154,17 +156,19 @@ class JiraIntegration:
             try:
                 size = self.queue.qsize()
                 logging.info(f"Queue size: {size}")
+
+                try:
+                    await asyncio.wait_for(self.stop_event.wait(), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
             except asyncio.CancelledError:
                 logging.info("Queue monitor cancelled")
                 break
             except Exception as e:
                 logging.error(f"Error checking queue size: {e}")
-
-            try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=1.0)
-            except asyncio.CancelledError:
-                logging.info("Queue monitor cancelled")
-                break
+                await asyncio.sleep(1.0)
 
 
     async def stop(self):

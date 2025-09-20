@@ -1,10 +1,10 @@
 """
-Jira Client - полноценный клиент для работы с Jira API
+Jira Client - полноценный асинхронный клиент для работы с Jira API
 """
 
-import requests
+import aiohttp
+import asyncio
 import logging
-import threading
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
@@ -25,7 +25,7 @@ class JiraIssue:
 
 
 class JiraClient:
-    """Клиент для работы с Jira API"""
+    """Асинхронный клиент для работы с Jira API"""
 
     def __init__(
         self,
@@ -50,54 +50,86 @@ class JiraClient:
         self.api_token = api_token
         self.password = password
         self.auth_type = auth_type
-        self.session = requests.Session()
+        self.session: Optional[aiohttp.ClientSession] = None
 
-        self._lock = threading.RLock()
+        self._lock = asyncio.Lock()
 
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-        self._setup_auth()
+        self._headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Python-Jira-Client/1.0",
+        }
 
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "Python-Jira-Client/1.0",
-            }
-        )
+        self._setup_auth()
 
     def _setup_auth(self):
         """Настройка авторизации в зависимости от типа"""
         if self.auth_type == "bearer" and self.api_token:
-            self.session.headers["Authorization"] = f"Bearer {self.api_token}"
+            self._headers["Authorization"] = f"Bearer {self.api_token}"
         elif self.auth_type == "basic" and self.username and self.password:
-            self.session.auth = (self.username, self.password)
+            # Для basic auth будем использовать aiohttp.BasicAuth
+            self._auth = aiohttp.BasicAuth(self.username, self.password)
         elif self.auth_type == "session":
-            self._get_session_token()
+            # Для session auth токен будет получен при первом запросе
+            pass
         else:
             raise ValueError(
                 f"Неверные параметры для авторизации типа {self.auth_type}"
             )
 
-    def _get_session_token(self):
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Получает или создает асинхронную сессию"""
+        if self.session is None or self.session.closed:
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            timeout = aiohttp.ClientTimeout(total=30)
+
+            auth = None
+            if self.auth_type == "basic" and hasattr(self, '_auth'):
+                auth = self._auth
+
+            self.session = aiohttp.ClientSession(
+                headers=self._headers,
+                connector=connector,
+                timeout=timeout,
+                auth=auth
+            )
+        return self.session
+
+    async def _get_session_token(self):
         """Получение токена сессии для session auth"""
         if not self.username or not self.password:
             raise ValueError("Для session auth нужны username и password")
 
         session_data = {"username": self.username, "password": self.password}
+        session = await self._get_session()
 
         try:
-            response = self.session.post(
+            async with session.post(
                 f"{self.base_url}/rest/auth/1/session",
                 json=session_data,
                 headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
+            ) as response:
+                response.raise_for_status()
         except Exception as e:
             raise ValueError(f"Ошибка получения токена сессии: {e}")
 
-    def _make_request(
+    async def close(self):
+        """Закрывает асинхронную сессию"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def __aenter__(self):
+        """Асинхронный контекстный менеджер - вход"""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Асинхронный контекстный менеджер - выход"""
+        await self.close()
+
+    async def _make_request(
         self,
         method: str,
         endpoint: str,
@@ -105,7 +137,7 @@ class JiraClient:
         api_type: str = "api",
     ) -> Dict:
         """
-        Выполняет HTTP запрос к Jira API (thread-safe)
+        Выполняет асинхронный HTTP запрос к Jira API (thread-safe)
 
         Args:
             method: HTTP метод (GET, POST, PUT, DELETE)
@@ -117,52 +149,42 @@ class JiraClient:
             Ответ от API в виде словаря
 
         Raises:
-            requests.RequestException: При ошибке HTTP запроса
+            aiohttp.ClientError: При ошибке HTTP запроса
         """
-        with self._lock:
+        async with self._lock:
             if api_type == "agile":
                 url = f"{self.base_url}/rest/agile/latest/{endpoint}"
             else:
                 url = f"{self.base_url}/rest/api/2/{endpoint}"
 
+            session = await self._get_session()
+
+            # Для session auth получаем токен при первом запросе
+            if self.auth_type == "session":
+                await self._get_session_token()
+
             try:
                 if method.upper() == "GET":
-                    response = self.session.get(url, params=data)
+                    async with session.get(url, params=data) as response:
+                        await self._handle_response(response, method, url, data)
+                        return await self._parse_response(response)
                 elif method.upper() == "POST":
-                    response = self.session.post(url, json=data)
+                    async with session.post(url, json=data) as response:
+                        await self._handle_response(response, method, url, data)
+                        return await self._parse_response(response)
                 elif method.upper() == "PUT":
-                    response = self.session.put(url, json=data)
+                    async with session.put(url, json=data) as response:
+                        await self._handle_response(response, method, url, data)
+                        return await self._parse_response(response)
                 elif method.upper() == "DELETE":
-                    response = self.session.delete(url)
+                    async with session.delete(url) as response:
+                        await self._handle_response(response, method, url, data)
+                        return await self._parse_response(response)
                 else:
                     raise ValueError(f"Неподдерживаемый HTTP метод: {method}")
 
-                response.raise_for_status()
-
-                if response.status_code == 204:
-                    return {}
-
-                content_type = response.headers.get("content-type", "").lower()
-                if "application/json" not in content_type:
-                    self.logger.warning(f"Сервер вернул не JSON. Content-Type: {content_type}")
-                    self.logger.warning(f"Текст ответа: {response.text[:500]}")
-                    raise ValueError(
-                        f"Сервер вернул не JSON ответ. Content-Type: {content_type}"
-                    )
-
-                return response.json()
-
-            except requests.exceptions.RequestException as e:
+            except aiohttp.ClientError as e:
                 self.logger.error(f"Ошибка при выполнении запроса {method} {url}: {e}")
-                if hasattr(e, "response") and e.response is not None:
-                    self.logger.error(f"Статус код: {e.response.status_code}")
-                    self.logger.error(f"Заголовки ответа: {dict(e.response.headers)}")
-                    self.logger.error(f"Текст ответа (первые 500 символов): {e.response.text[:500]}")
-                    try:
-                        error_data = e.response.json()
-                        self.logger.error(f"JSON ошибки: {error_data}")
-                    except:
-                        self.logger.error("Ответ не является валидным JSON")
                 raise
             except ValueError as e:
                 self.logger.error(f"Ошибка парсинга JSON: {e}")
@@ -171,8 +193,47 @@ class JiraClient:
                 self.logger.error(f"Данные: {data}")
                 raise
 
+    async def _handle_response(self, response: aiohttp.ClientResponse, method: str, url: str, data: Optional[Dict]):
+        """Обрабатывает ответ от сервера"""
+        try:
+            response.raise_for_status()
+        except aiohttp.ClientResponseError as e:
+            self.logger.error(f"Ошибка HTTP {e.status}: {e.message}")
+            self.logger.error(f"URL: {url}")
+            self.logger.error(f"Метод: {method}")
+            self.logger.error(f"Данные: {data}")
+            try:
+                error_text = await response.text()
+                self.logger.error(f"Текст ответа (первые 500 символов): {error_text[:500]}")
+            except:
+                self.logger.error("Не удалось получить текст ответа")
+            raise
 
-    def get_myself(self) -> Dict:
+    async def _parse_response(self, response: aiohttp.ClientResponse) -> Dict:
+        """Парсит ответ от сервера"""
+        if response.status == 204:
+            return {}
+
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/json" not in content_type:
+            self.logger.warning(f"Сервер вернул не JSON. Content-Type: {content_type}")
+            try:
+                text = await response.text()
+                self.logger.warning(f"Текст ответа: {text[:500]}")
+            except:
+                self.logger.warning("Не удалось получить текст ответа")
+            raise ValueError(
+                f"Сервер вернул не JSON ответ. Content-Type: {content_type}"
+            )
+
+        try:
+            return await response.json()
+        except Exception as e:
+            self.logger.error(f"Ошибка парсинга JSON: {e}")
+            raise
+
+
+    async def get_myself(self) -> Dict:
         """
         Получает информацию о текущем пользователе
 
@@ -180,12 +241,12 @@ class JiraClient:
             Информация о текущем пользователе
         """
         try:
-            return self._make_request("GET", "myself")
+            return await self._make_request("GET", "myself")
         except Exception as e:
             self.logger.error(f"Ошибка при получении информации о пользователе: {e}")
             raise
 
-    def test_connection(self) -> bool:
+    async def test_connection(self) -> bool:
         """
         Проверяет соединение с Jira через myself API
 
@@ -193,7 +254,7 @@ class JiraClient:
             True если соединение успешно, False иначе
         """
         try:
-            self.get_myself()
+            await self.get_myself()
             self.logger.info("Соединение с Jira установлено успешно")
             return True
         except Exception as e:
@@ -201,7 +262,7 @@ class JiraClient:
             return False
 
 
-    def get_projects(self) -> List[Dict]:
+    async def get_projects(self) -> List[Dict]:
         """
         Получает список проектов
 
@@ -209,14 +270,14 @@ class JiraClient:
             Список проектов
         """
         try:
-            projects = self._make_request("GET", "project")
+            projects = await self._make_request("GET", "project")
             self.logger.info(f"Найдено проектов: {len(projects)}")
             return projects
         except Exception as e:
             self.logger.error(f"Ошибка при получении проектов: {e}")
             return []
 
-    def get_project(self, project_key_or_id: str) -> Dict:
+    async def get_project(self, project_key_or_id: str) -> Dict:
         """
         Получает информацию о проекте
 
@@ -227,12 +288,12 @@ class JiraClient:
             Информация о проекте
         """
         try:
-            return self._make_request("GET", f"project/{project_key_or_id}")
+            return await self._make_request("GET", f"project/{project_key_or_id}")
         except Exception as e:
             self.logger.error(f"Ошибка при получении проекта {project_key_or_id}: {e}")
             raise
 
-    def search_issues(
+    async def search_issues(
         self,
         jql: str,
         start_at: int = 0,
@@ -261,14 +322,14 @@ class JiraClient:
             search_data["expand"] = expand
 
         try:
-            result = self._make_request("POST", "search", search_data)
+            result = await self._make_request("POST", "search", search_data)
             self.logger.info(f"Найдено задач: {result.get('total', 0)}")
             return result
         except Exception as e:
             self.logger.error(f"Ошибка при поиске задач: {e}")
             raise
 
-    def get_issue(
+    async def get_issue(
         self,
         issue_key_or_id: str,
         fields: Optional[List[str]] = None,
@@ -292,12 +353,12 @@ class JiraClient:
             params["expand"] = ",".join(expand)
 
         try:
-            return self._make_request("GET", f"issue/{issue_key_or_id}", params)
+            return await self._make_request("GET", f"issue/{issue_key_or_id}", params)
         except Exception as e:
             self.logger.error(f"Ошибка при получении задачи {issue_key_or_id}: {e}")
             raise
 
-    def create_issue(self, issue: JiraIssue) -> str:
+    async def create_issue(self, issue: JiraIssue) -> str:
         """
         Создает новую задачу
 
@@ -334,7 +395,7 @@ class JiraClient:
             issue_data["fields"].update(issue.custom_fields)
 
         try:
-            result = self._make_request("POST", "issue", issue_data)
+            result = await self._make_request("POST", "issue", issue_data)
             issue_key = result.get("key")
             self.logger.info(f"Задача создана: {issue_key}")
             return issue_key
@@ -342,7 +403,7 @@ class JiraClient:
             self.logger.error(f"Ошибка при создании задачи: {e}")
             raise
 
-    def update_issue(self, issue_key_or_id: str, fields: Dict[str, Any]) -> None:
+    async def update_issue(self, issue_key_or_id: str, fields: Dict[str, Any]) -> None:
         """
         Обновляет задачу
 
@@ -352,13 +413,13 @@ class JiraClient:
         """
         try:
             update_data = {"fields": fields}
-            self._make_request("PUT", f"issue/{issue_key_or_id}", update_data)
+            await self._make_request("PUT", f"issue/{issue_key_or_id}", update_data)
             self.logger.info(f"Задача {issue_key_or_id} обновлена")
         except Exception as e:
             self.logger.error(f"Ошибка при обновлении задачи {issue_key_or_id}: {e}")
             raise
 
-    def add_comment(self, issue_key_or_id: str, comment_body: str) -> None:
+    async def add_comment(self, issue_key_or_id: str, comment_body: str) -> None:
         """
         Добавляет комментарий к задаче
 
@@ -369,7 +430,7 @@ class JiraClient:
         comment_data = {"body": comment_body}
 
         try:
-            self._make_request("POST", f"issue/{issue_key_or_id}/comment", comment_data)
+            await self._make_request("POST", f"issue/{issue_key_or_id}/comment", comment_data)
             self.logger.info(f"Комментарий добавлен к задаче {issue_key_or_id}")
         except Exception as e:
             self.logger.error(
@@ -390,7 +451,7 @@ class JiraClient:
         return f"{self.base_url}/browse/{issue_key}"
 
 
-    def get_boards(
+    async def get_boards(
         self,
         start_at: int = 0,
         max_results: int = 50,
@@ -421,7 +482,7 @@ class JiraClient:
             params["projectKeyOrId"] = project_key_or_id
 
         try:
-            result = self._make_request("GET", "board", params, api_type="agile")
+            result = await self._make_request("GET", "board", params, api_type="agile")
             boards = result.get("values", [])
             self.logger.info(f"Найдено досок: {len(boards)}")
             return boards
@@ -429,7 +490,7 @@ class JiraClient:
             self.logger.error(f"Ошибка при получении досок: {e}")
             return []
 
-    def get_board(self, board_id: int) -> Dict:
+    async def get_board(self, board_id: int) -> Dict:
         """
         Получает информацию о конкретной доске
 
@@ -440,12 +501,12 @@ class JiraClient:
             Информация о доске
         """
         try:
-            return self._make_request("GET", f"board/{board_id}", api_type="agile")
+            return await self._make_request("GET", f"board/{board_id}", api_type="agile")
         except Exception as e:
             self.logger.error(f"Ошибка при получении доски {board_id}: {e}")
             raise
 
-    def get_board_issues(
+    async def get_board_issues(
         self,
         board_id: int,
         start_at: int = 0,
@@ -474,7 +535,7 @@ class JiraClient:
             params["fields"] = fields
 
         try:
-            result = self._make_request(
+            result = await self._make_request(
                 "GET", f"board/{board_id}/issue", params, api_type="agile"
             )
             issues = result.get("issues", [])
@@ -484,7 +545,7 @@ class JiraClient:
             self.logger.error(f"Ошибка при получении задач доски {board_id}: {e}")
             return []
 
-    def get_board_backlog(
+    async def get_board_backlog(
         self,
         board_id: int,
         start_at: int = 0,
@@ -513,7 +574,7 @@ class JiraClient:
             params["fields"] = fields
 
         try:
-            result = self._make_request(
+            result = await self._make_request(
                 "GET", f"board/{board_id}/backlog", params, api_type="agile"
             )
             issues = result.get("issues", [])
@@ -523,7 +584,7 @@ class JiraClient:
             self.logger.error(f"Ошибка при получении бэклога доски {board_id}: {e}")
             return []
 
-    def create_sprint(
+    async def create_sprint(
         self,
         name: str,
         origin_board_id: int,
@@ -559,14 +620,14 @@ class JiraClient:
             sprint_data["goal"] = goal
 
         try:
-            result = self._make_request("POST", "sprint", sprint_data, api_type="agile")
+            result = await self._make_request("POST", "sprint", sprint_data, api_type="agile")
             self.logger.info(f"Создан спринт: {name}")
             return result
         except Exception as e:
             self.logger.error(f"Ошибка при создании спринта: {e}")
             raise
 
-    def get_sprint_issues(
+    async def get_sprint_issues(
         self,
         sprint_id: int,
         start_at: int = 0,
@@ -595,7 +656,7 @@ class JiraClient:
             params["fields"] = fields
 
         try:
-            result = self._make_request(
+            result = await self._make_request(
                 "GET", f"sprint/{sprint_id}/issue", params, api_type="agile"
             )
             issues = result.get("issues", [])
@@ -605,7 +666,7 @@ class JiraClient:
             self.logger.error(f"Ошибка при получении задач спринта {sprint_id}: {e}")
             return []
 
-    def move_issues_to_sprint(self, sprint_id: int, issue_keys: List[str]) -> None:
+    async def move_issues_to_sprint(self, sprint_id: int, issue_keys: List[str]) -> None:
         """
         Перемещает задачи в спринт
 
@@ -616,7 +677,7 @@ class JiraClient:
         move_data = {"issues": issue_keys}
 
         try:
-            self._make_request(
+            await self._make_request(
                 "POST", f"sprint/{sprint_id}/issue", move_data, api_type="agile"
             )
             self.logger.info(f"Перемещено {len(issue_keys)} задач в спринт {sprint_id}")
@@ -624,7 +685,7 @@ class JiraClient:
             self.logger.error(f"Ошибка при перемещении задач в спринт: {e}")
             raise
 
-    def move_issues_to_backlog(self, issue_keys: List[str]) -> None:
+    async def move_issues_to_backlog(self, issue_keys: List[str]) -> None:
         """
         Перемещает задачи в бэклог
 
@@ -634,7 +695,7 @@ class JiraClient:
         move_data = {"issues": issue_keys}
 
         try:
-            self._make_request("POST", "backlog/issue", move_data, api_type="agile")
+            await self._make_request("POST", "backlog/issue", move_data, api_type="agile")
             self.logger.info(f"Перемещено {len(issue_keys)} задач в бэклог")
         except Exception as e:
             self.logger.error(f"Ошибка при перемещении задач в бэклог: {e}")
