@@ -1,13 +1,13 @@
-# Jira Client Library
+# Jira Integration Library
 
-Полноценная библиотека для работы с Jira API, включающая создание задач, управление спринтами, работу с досками и интеграцию с Kafka.
+Полноценная библиотека для работы с Jira API, включающая создание задач, управление спринтами и работу с досками. Использует thread-safe синхронный клиент с асинхронной интеграцией.
 
 ## 📁 Структура библиотеки
 
 ```
 lib/
-├── jira_client.py          # Основной синхронный клиент для Jira API
-├── async_jira_service.py  # Асинхронный сервис для интеграции
+├── jira_client.py          # Основной синхронный клиент для Jira API (thread-safe)
+├── jira_provider.py        # Интерфейс и реализации провайдеров данных
 ├── __init__.py            # Инициализация модуля
 └── README.md              # Эта документация
 ```
@@ -60,9 +60,10 @@ if client.test_connection():
 
 ### JiraClient
 
-Синхронный клиент для работы с Jira API.
+Thread-safe синхронный клиент для работы с Jira API.
 
 **Особенности:**
+- ✅ **Thread-safe** - использует `RLock` для безопасной работы из нескольких потоков
 - ✅ Полная поддержка Jira REST API
 - ✅ Agile API для работы с досками и спринтами
 - ✅ Автоматическая обработка ошибок
@@ -102,6 +103,7 @@ client.update_issue(issue_key, {
     "summary": "Обновленное название задачи"
 })
 ```
+
 
 ### AsyncJiraService
 
@@ -301,6 +303,138 @@ for issue in issues_data:
 client.logger.info(f"Создано задач: {len(created_issues)}")
 ```
 
+### Работа с очередями
+
+```python
+import threading
+import asyncio
+from lib import Queue
+from lib.async_queue import AsyncQueue
+
+# Thread-safe очередь
+def worker(queue):
+    while True:
+        try:
+            item = queue.get(timeout=1)
+            print(f"Обработано: {item}")
+            queue.task_done()
+        except:
+            break
+
+# Создание очереди и запуск worker'ов
+queue = Queue()
+for i in range(3):
+    t = threading.Thread(target=worker, args=(queue,))
+    t.start()
+
+# Добавление задач
+for i in range(10):
+    queue.put(f"задача {i}")
+
+queue.join()  # Ожидание завершения всех задач
+
+# Асинхронная очередь
+async def async_worker(queue):
+    while not queue.empty():
+        item = await queue.get()
+        print(f"Асинхронно обработано: {item}")
+        await asyncio.sleep(0.1)
+
+async def async_producer(queue):
+    for i in range(5):
+        await queue.put(f"async задача {i}")
+        await asyncio.sleep(0.1)
+
+async def async_example():
+    queue = AsyncQueue()
+
+    # Запуск producer и consumer параллельно
+    await asyncio.gather(
+        async_producer(queue),
+        async_worker(queue)
+    )
+
+asyncio.run(async_example())
+```
+
+### Асинхронная интеграция с очередями
+
+```python
+import asyncio
+from lib import AsyncJiraClient, JiraIssue
+
+async def jira_to_queue_integration():
+    """Интеграция Jira с асинхронной очередью"""
+
+    # Создание компонентов
+    jira_client = AsyncJiraClient(
+        base_url="https://yourcompany.atlassian.net",
+        username="your.email@company.com",
+        api_token="your_api_token"
+    )
+
+    queue = asyncio.Queue(maxsize=1000)
+
+    async with jira_client:
+        # Запуск задач параллельно
+        await asyncio.gather(
+            jira_poller(jira_client, queue),
+            issue_processor(queue),
+            return_exceptions=True
+        )
+
+async def jira_poller(jira_client, queue):
+    """Опрос Jira и добавление задач в очередь"""
+    while True:
+        try:
+            # Получение новых задач
+            issues = await jira_client.search_issues(
+                "updated >= -1d",
+                max_results=50
+            )
+
+            # Добавление в очередь
+            for issue in issues.get('issues', []):
+                await queue.put({
+                    'type': 'issue_update',
+                    'data': issue,
+                    'timestamp': asyncio.get_event_loop().time()
+                })
+
+            await asyncio.sleep(60)  # Пауза между опросами
+
+        except Exception as e:
+            print(f"Ошибка опроса Jira: {e}")
+            await asyncio.sleep(30)
+
+async def issue_processor(queue):
+    """Обработка задач из очереди"""
+    while True:
+        try:
+            # Получение задачи из очереди
+            item = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+            if item['type'] == 'issue_update':
+                issue = item['data']
+                print(f"Обрабатываю задачу: {issue['key']}")
+
+                # Здесь ваша логика обработки
+                await process_issue(issue)
+
+        except asyncio.TimeoutError:
+            continue
+        except Exception as e:
+            print(f"Ошибка обработки: {e}")
+
+async def process_issue(issue):
+    """Обработка одной задачи"""
+    # Ваша бизнес-логика
+    print(f"Обработана задача: {issue['key']} - {issue['fields']['summary']}")
+
+# Запуск интеграции
+asyncio.run(jira_to_queue_integration())
+```
+
 ### Интеграция с Kafka
 
 ```python
@@ -327,7 +461,7 @@ asyncio.run(sync_jira_to_kafka())
 
 ## 📊 Поддерживаемые операции
 
-### Основные операции
+### Jira API операции (Синхронные)
 - ✅ **Создание задач** - полная поддержка всех полей
 - ✅ **Получение задач** - детальная информация
 - ✅ **Обновление задач** - изменение любых полей
@@ -337,17 +471,83 @@ asyncio.run(sync_jira_to_kafka())
 - ✅ **Управление проектами** - получение списка проектов
 - ✅ **Обработка ошибок** - детальное логирование
 
+### Jira API операции (Асинхронные)
+- ✅ **Асинхронные операции** - все методы с `async/await`
+- ✅ **Context manager** - автоматическое управление ресурсами
+- ✅ **Concurrent запросы** - ограничение через семафор
+- ✅ **Batch операции** - массовое создание задач
+- ✅ **Автоматическая пагинация** - получение всех результатов
+- ✅ **Высокая производительность** - неблокирующие операции
+
 ### Agile API операции
 - ✅ **Доски (Boards)** - получение и управление
 - ✅ **Спринты** - создание и управление
 - ✅ **Бэклог** - получение задач бэклога
 - ✅ **Перемещение задач** - между спринтами и бэклогом
 
+
 ### Интеграционные возможности
 - ✅ **Асинхронная работа** - для интеграции с другими системами
 - ✅ **Контекстные менеджеры** - автоматическое управление ресурсами
 - ✅ **Логирование** - структурированные логи
 - ✅ **Обработка ошибок** - graceful error handling
+
+## ⚡ Производительность
+
+### Сравнение синхронного и асинхронного подходов
+
+**Синхронный подход (JiraClient):**
+```python
+# Последовательное выполнение
+for issue_data in issues_data:
+    issue_key = client.create_issue(issue_data)  # Блокирующий вызов
+    client.add_comment(issue_key, "Комментарий")  # Блокирующий вызов
+```
+
+**Асинхронный подход (AsyncJiraClient):**
+```python
+# Параллельное выполнение
+async def create_and_comment(issue_data):
+    issue_key = await client.create_issue(issue_data)
+    await client.add_comment(issue_key, "Комментарий")
+    return issue_key
+
+# Все задачи выполняются параллельно
+results = await asyncio.gather(*[
+    create_and_comment(issue_data) for issue_data in issues_data
+])
+```
+
+### Рекомендации по производительности
+
+**Используйте AsyncJiraClient когда:**
+- ✅ Нужно обработать много задач (> 10)
+- ✅ Интеграция с другими асинхронными системами
+- ✅ Требуется высокая пропускная способность
+- ✅ Работа с очередями и event-driven архитектурой
+
+**Используйте JiraClient когда:**
+- ✅ Простые скрипты и автоматизация
+- ✅ Малое количество операций
+- ✅ Синхронная архитектура приложения
+- ✅ Простота отладки важнее производительности
+
+### Настройка производительности
+
+```python
+# Оптимальные настройки для AsyncJiraClient
+client = AsyncJiraClient(
+    base_url="https://yourcompany.atlassian.net",
+    username="your.email@company.com",
+    api_token="your_api_token",
+    max_concurrent_requests=20,  # Увеличить для мощных серверов
+    timeout=60  # Увеличить для медленных сетей
+)
+
+# Batch операции для максимальной эффективности
+issues_batch = [JiraIssue(...) for _ in range(100)]
+created_keys = await client.create_issues_batch(issues_batch)
+```
 
 ## 🔒 Безопасность
 
@@ -457,11 +657,128 @@ client.logger.info(f"Пользователь: {user_info.get('displayName')}")
 
 ## 📋 Требования
 
+### Основные зависимости
 - Python 3.7+
 - requests >= 2.31.0
 - python-dateutil >= 2.8.2
 - pydantic >= 2.0.0
 - typing-extensions >= 4.5.0
+
+### Для асинхронных операций
+- aiohttp >= 3.8.0
+- asyncio (встроенный в Python 3.7+)
+
+### Для очередей
+- threading (встроенный)
+- queue (встроенный)
+- asyncio (встроенный)
+
+## 🔧 Примеры использования
+
+### JiraClient в JiraIntegration
+
+```python
+import asyncio
+import os
+from lib import JiraClient, JiraIssue, JiraJsonProvider
+from service.jira_integration import JiraIntegration
+
+async def main():
+    """Пример использования thread-safe JiraClient в асинхронной интеграции"""
+
+    # Настройка переменных окружения
+    os.environ['JIRA_BASE_URL'] = 'https://yourcompany.atlassian.net'
+    os.environ['JIRA_USERNAME'] = 'your.email@company.com'
+    os.environ['JIRA_API_TOKEN'] = 'your_api_token_here'
+
+    # Создание провайдера данных
+    jira_provider = JiraJsonProvider('data/sample_data.json')
+
+    # Создание и запуск интеграции
+    integration = JiraIntegration(jira_provider=jira_provider)
+
+    try:
+        await integration.start()
+    except KeyboardInterrupt:
+        print("Остановка интеграции...")
+        await integration.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+**Архитектура интеграции:**
+- ✅ **Thread-safe JiraClient** - безопасен для использования из асинхронного кода
+- ✅ **Асинхронная интеграция** - использует `asyncio` для обработки задач
+- ✅ **Очередь задач** - `asyncio.Queue` для буферизации
+- ✅ **Провайдеры данных** - гибкая система получения данных
+
+### JiraJsonProvider - Мониторинг JSON файла
+
+```python
+import asyncio
+from lib import JiraJsonProvider
+
+async def on_new_issues(issues):
+    """Callback функция для обработки новых задач"""
+    print(f"Получены новые задачи: {len(issues)}")
+    for issue in issues:
+        key = issue.get('key', 'N/A')
+        summary = issue.get('fields', {}).get('summary', 'N/A')
+        print(f"- {key}: {summary}")
+
+async def main():
+    # Создание поставщика с интервалом проверки 2 секунды
+    provider = JiraJsonProvider("data/sample_data.json", check_interval=2.0)
+
+    # Запуск мониторинга
+    await provider.start_monitoring(on_new_issues)
+
+    # Работаем некоторое время
+    await asyncio.sleep(30)
+
+    # Остановка мониторинга
+    await provider.stop_monitoring()
+
+# Запуск
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Интеграция с JiraIntegration
+
+```python
+from lib import JiraJsonProvider, AsyncJiraClient
+import asyncio
+
+class JiraIntegration:
+    def __init__(self):
+        self.provider = JiraJsonProvider("data/sample_data.json")
+        self.jira_client = AsyncJiraClient()
+        self.queue = asyncio.Queue()
+
+    async def start(self):
+        # Запускаем мониторинг файла
+        await self.provider.start_monitoring(self.handle_new_issues)
+
+        # Обрабатываем задачи из очереди
+        await self.process_queue()
+
+    async def handle_new_issues(self, issues):
+        """Обработка новых задач из файла"""
+        for issue in issues:
+            await self.queue.put({
+                'type': 'issue_update',
+                'data': issue
+            })
+
+    async def process_queue(self):
+        """Обработка очереди задач"""
+        while True:
+            item = await self.queue.get()
+            if item['type'] == 'issue_update':
+                await self.jira_client.create_issue(item['data'])
+```
 
 ## 📚 Дополнительные ресурсы
 
